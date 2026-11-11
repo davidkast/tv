@@ -10,8 +10,8 @@ android {
         applicationId = "com.tuapp.tvcleaner.adb"
         minSdk = 26
         targetSdk = 34
-        versionCode = 3
-        versionName = "5.0"
+        versionCode = 4
+        versionName = "5.1"
     }
 
     compileOptions {

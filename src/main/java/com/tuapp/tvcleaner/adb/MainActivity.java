@@ -264,7 +264,7 @@ public class MainActivity extends Activity {
         String runningOutput = runShellCommand(in, out, 2, "ps -A -o NAME,ARGS");
         String defaultLauncherOut = runShellCommand(
             in, out, 3,
-            "cmd shortcut get-default-launcher; cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME"
+            "cmd shortcut get-default-launcher; cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME; cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.HOME"
         );
 
         // 3. Obtener TODAS las apps instaladas (de usuario + preinstaladas con icono en TV/Android)
@@ -275,12 +275,13 @@ public class MainActivity extends Activity {
             "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
         );
 
-        // 4. Construir lista blanca (sistema + launchers + el launcher activo detectado)
+        // 4. Construir lista blanca (sistema + launchers + com.gathin.tvhome de cleanyourtv)
         Set<String> whitelist = new HashSet<>(Arrays.asList(
             "android",
             "com.tuapp.tvcleaner",
             "com.tuapp.tvcleaner.adb",
-            // Launchers personalizados y oficiales
+            // Launcher custom cleanyourtv y otros launchers personalizados/oficiales
+            "com.gathin.tvhome",
             "com.spocky.projengmenu",
             "me.efesser.flauncher",
             "com.wolf.firelauncher",
@@ -313,6 +314,9 @@ public class MainActivity extends Activity {
                 String beforeSlash = trimmed.split("/")[0];
                 if (beforeSlash.contains("{")) {
                     beforeSlash = beforeSlash.substring(beforeSlash.lastIndexOf('{') + 1);
+                }
+                if (beforeSlash.contains(" ")) {
+                    beforeSlash = beforeSlash.substring(beforeSlash.lastIndexOf(' ') + 1);
                 }
                 beforeSlash = beforeSlash.trim();
                 if (!beforeSlash.isEmpty()) {
