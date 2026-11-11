@@ -1,17 +1,23 @@
 package com.tuapp.tvcleaner.adb;
 
 import android.app.Activity;
+import android.content.Context;
 import android.content.SharedPreferences;
+import android.net.nsd.NsdManager;
+import android.net.nsd.NsdServiceInfo;
 import android.os.Bundle;
 import android.os.Environment;
 import android.os.StatFs;
+import android.provider.Settings;
 import android.util.Base64;
 import android.widget.Toast;
 
+import java.io.ByteArrayInputStream;
 import java.io.ByteArrayOutputStream;
 import java.io.InputStream;
 import java.io.OutputStream;
 import java.math.BigInteger;
+import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.net.Socket;
 import java.nio.ByteBuffer;
@@ -20,8 +26,12 @@ import java.nio.charset.StandardCharsets;
 import java.security.KeyFactory;
 import java.security.KeyPair;
 import java.security.KeyPairGenerator;
+import java.security.Principal;
 import java.security.PrivateKey;
+import java.security.SecureRandom;
 import java.security.Signature;
+import java.security.cert.CertificateFactory;
+import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
@@ -30,11 +40,22 @@ import java.util.Arrays;
 import java.util.HashSet;
 import java.util.List;
 import java.util.Set;
+import java.util.concurrent.CountDownLatch;
+import java.util.concurrent.TimeUnit;
+import java.util.concurrent.atomic.AtomicReference;
+
+import javax.net.ssl.KeyManager;
+import javax.net.ssl.SSLContext;
+import javax.net.ssl.SSLSocket;
+import javax.net.ssl.TrustManager;
+import javax.net.ssl.X509ExtendedKeyManager;
+import javax.net.ssl.X509TrustManager;
 
 public class MainActivity extends Activity {
 
     private static final int A_CNXN = 0x4e584e43;
     private static final int A_AUTH = 0x48545541;
+    private static final int A_STLS = 0x534c5453;
     private static final int A_OPEN = 0x4e45504f;
     private static final int A_OKAY = 0x59414b4f;
     private static final int A_WRTE = 0x45545257;
@@ -43,6 +64,7 @@ public class MainActivity extends Activity {
     private static final int ADB_AUTH_TOKEN = 1;
     private static final int ADB_AUTH_SIGNATURE = 2;
     private static final int ADB_AUTH_RSAPUBLICKEY = 3;
+    private static final int A_STLS_VERSION = 0x01000000;
 
     private static final byte[] SHA1_DIGEST_INFO = new byte[]{
         0x30, 0x21, 0x30, 0x09, 0x06, 0x05, 0x2b, 0x0e,
@@ -60,59 +82,16 @@ public class MainActivity extends Activity {
                 long freeBefore = getAvailableMegabytes();
                 KeyPair keyPair = getOrCreateKeyPair();
 
-                int stoppedApps = 0;
-
-                try (Socket socket = new Socket()) {
-                    socket.connect(new InetSocketAddress("127.0.0.1", 5555), 5000);
-                    socket.setSoTimeout(30000);
-
-                    InputStream in = socket.getInputStream();
-                    OutputStream out = socket.getOutputStream();
-
-                    connectAdb(in, out, keyPair);
-
-                    runShellCommand(in, out, 1, "pm trim-caches 999G");
-
-                    String runningOutput = runShellCommand(in, out, 2, "ps -A");
-                    String packagesOutput = runShellCommand(in, out, 3, "pm list packages -3");
-
-                    Set<String> whitelist = new HashSet<>(Arrays.asList(
-                        "com.tuapp.tvcleaner",
-                        "com.tuapp.tvcleaner.adb",
-                        "me.efesser.flauncher",
-                        "com.spocky.projengmenu",
-                        "com.wolf.firelauncher",
-                        "flar2.homebutton",
-                        "dev.vodik7.tvquickactions"
-                    ));
-
-                    List<String> targetPackages = new ArrayList<>(Arrays.asList(
-                        "com.google.android.youtube.tv",
-                        "com.google.android.youtube.tvmusic",
-                        "com.netflix.ninja",
-                        "com.amazon.amazonvideo.livingroom"
-                    ));
-
-                    for (String line : packagesOutput.split("\r?\n")) {
-                        String pkg = line.replace("package:", "").trim();
-                        if (!pkg.isEmpty() && !targetPackages.contains(pkg)) {
-                            targetPackages.add(pkg);
-                        }
-                    }
-
-                    StringBuilder stopCmd = new StringBuilder();
-                    for (String pkg : targetPackages) {
-                        if (whitelist.contains(pkg)) continue;
-                        if (runningOutput.contains(pkg)) {
-                            stoppedApps++;
-                        }
-                        if (stopCmd.length() > 0) stopCmd.append("; ");
-                        stopCmd.append("am force-stop ").append(pkg);
-                    }
-
-                    if (stopCmd.length() > 0) {
-                        runShellCommand(in, out, 4, stopCmd.toString());
-                    }
+                int stoppedApps;
+                try {
+                    stoppedApps = executeCleanupOverTcp5555(keyPair);
+                } catch (Exception tcpEx) {
+                    runOnUiThread(() -> Toast.makeText(
+                        MainActivity.this,
+                        "Puerto 5555 inactivo tras reinicio. Auto-conectando por ADB Wi-Fi...",
+                        Toast.LENGTH_SHORT
+                    ).show());
+                    stoppedApps = executeCleanupOverWirelessTls(keyPair);
                 }
 
                 long freeAfter = getAvailableMegabytes();
@@ -132,7 +111,7 @@ public class MainActivity extends Activity {
                 runOnUiThread(() -> {
                     Toast.makeText(
                         MainActivity.this,
-                        "Activa Depuración ADB (puerto 5555) y acepta el permiso en pantalla: " + e.getMessage(),
+                        "Aviso ADB: " + e.getMessage(),
                         Toast.LENGTH_LONG
                     ).show();
                     finish();
@@ -141,7 +120,202 @@ public class MainActivity extends Activity {
         }).start();
     }
 
-    private void connectAdb(InputStream in, OutputStream out, KeyPair keyPair) throws Exception {
+    private int executeCleanupOverTcp5555(KeyPair keyPair) throws Exception {
+        try (Socket socket = new Socket()) {
+            socket.connect(new InetSocketAddress("127.0.0.1", 5555), 1800);
+            socket.setSoTimeout(25000);
+
+            InputStream in = socket.getInputStream();
+            OutputStream out = socket.getOutputStream();
+
+            connectPlainAdb(in, out, keyPair);
+            return runCleanupSequence(in, out, false);
+        }
+    }
+
+    private int executeCleanupOverWirelessTls(KeyPair keyPair) throws Exception {
+        ensureWirelessAdbEnabled(false);
+
+        InetSocketAddress tlsTarget = discoverTlsAdbPort(2800);
+        if (tlsTarget == null) {
+            ensureWirelessAdbEnabled(true);
+            tlsTarget = discoverTlsAdbPort(5000);
+        }
+        if (tlsTarget == null) {
+            throw new Exception("No se detectó puerto ADB Wi-Fi. Concede WRITE_SECURE_SETTINGS o activa Depuración inalámbrica.");
+        }
+
+        try (Socket rawSocket = new Socket()) {
+            rawSocket.connect(tlsTarget, 4000);
+            rawSocket.setSoTimeout(25000);
+
+            InputStream rawIn = rawSocket.getInputStream();
+            OutputStream rawOut = rawSocket.getOutputStream();
+
+            sendPacket(rawOut, A_CNXN, 0x01000000, 4096, "host::\0".getBytes(StandardCharsets.UTF_8));
+            AdbMessage msg = readPacket(rawIn);
+
+            if (msg.command == A_STLS) {
+                sendPacket(rawOut, A_STLS, A_STLS_VERSION, 0, null);
+
+                SSLContext sslContext = createAdbSslContext(keyPair);
+                SSLSocket sslSocket = (SSLSocket) sslContext.getSocketFactory().createSocket(
+                    rawSocket,
+                    tlsTarget.getHostString(),
+                    tlsTarget.getPort(),
+                    true
+                );
+                sslSocket.setUseClientMode(true);
+                sslSocket.startHandshake();
+
+                InputStream tlsIn = sslSocket.getInputStream();
+                OutputStream tlsOut = sslSocket.getOutputStream();
+
+                AdbMessage cnxnMsg = readPacket(tlsIn);
+                if (cnxnMsg.command != A_CNXN) {
+                    throw new Exception("Clave RSA no autorizada aún en puerto 5555");
+                }
+
+                return runCleanupSequence(tlsIn, tlsOut, true);
+            } else if (msg.command == A_CNXN) {
+                return runCleanupSequence(rawIn, rawOut, true);
+            } else {
+                throw new Exception("Respuesta inesperada de ADB Wi-Fi");
+            }
+        }
+    }
+
+    private void ensureWirelessAdbEnabled(boolean forceToggle) {
+        try {
+            Settings.Global.putInt(getContentResolver(), "adb_enabled", 1);
+            if (forceToggle) {
+                Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 0);
+                Thread.sleep(400);
+            }
+            Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
+            Thread.sleep(500);
+        } catch (Exception ignored) {
+            // Si aún no tiene WRITE_SECURE_SETTINGS, continúa por si Depuración inalámbrica ya está activa
+        }
+    }
+
+    private InetSocketAddress discoverTlsAdbPort(long timeoutMs) {
+        NsdManager nsdManager = (NsdManager) getSystemService(Context.NSD_SERVICE);
+        if (nsdManager == null) return null;
+
+        CountDownLatch latch = new CountDownLatch(1);
+        AtomicReference<InetSocketAddress> result = new AtomicReference<>(null);
+
+        NsdManager.DiscoveryListener discoveryListener = new NsdManager.DiscoveryListener() {
+            @Override
+            public void onStartDiscoveryFailed(String serviceType, int errorCode) {
+                latch.countDown();
+            }
+
+            @Override
+            public void onStopDiscoveryFailed(String serviceType, int errorCode) {}
+
+            @Override
+            public void onDiscoveryStarted(String serviceType) {}
+
+            @Override
+            public void onDiscoveryStopped(String serviceType) {}
+
+            @Override
+            public void onServiceFound(NsdServiceInfo serviceInfo) {
+                nsdManager.resolveService(serviceInfo, new NsdManager.ResolveListener() {
+                    @Override
+                    public void onResolveFailed(NsdServiceInfo info, int errorCode) {}
+
+                    @Override
+                    public void onServiceResolved(NsdServiceInfo info) {
+                        InetAddress host = info.getHost();
+                        int port = info.getPort();
+                        if (host != null && port > 0) {
+                            result.compareAndSet(null, new InetSocketAddress(host, port));
+                            latch.countDown();
+                        }
+                    }
+                });
+            }
+
+            @Override
+            public void onServiceLost(NsdServiceInfo serviceInfo) {}
+        };
+
+        try {
+            nsdManager.discoverServices("_adb-tls-connect._tcp.", NsdManager.PROTOCOL_DNS_SD, discoveryListener);
+            latch.await(timeoutMs, TimeUnit.MILLISECONDS);
+        } catch (Exception ignored) {
+        } finally {
+            try {
+                nsdManager.stopServiceDiscovery(discoveryListener);
+            } catch (Exception ignored) {}
+        }
+
+        return result.get();
+    }
+
+    private int runCleanupSequence(InputStream in, OutputStream out, boolean reopenTcp5555) throws Exception {
+        int stoppedApps = 0;
+
+        runShellCommand(in, out, 1, "pm trim-caches 999G");
+
+        String runningOutput = runShellCommand(in, out, 2, "ps -A");
+        String packagesOutput = runShellCommand(in, out, 3, "pm list packages -3");
+
+        Set<String> whitelist = new HashSet<>(Arrays.asList(
+            "com.tuapp.tvcleaner",
+            "com.tuapp.tvcleaner.adb",
+            "me.efesser.flauncher",
+            "com.spocky.projengmenu",
+            "com.wolf.firelauncher",
+            "flar2.homebutton",
+            "dev.vodik7.tvquickactions"
+        ));
+
+        List<String> targetPackages = new ArrayList<>(Arrays.asList(
+            "com.google.android.youtube.tv",
+            "com.google.android.youtube.tvmusic",
+            "com.netflix.ninja",
+            "com.amazon.amazonvideo.livingroom"
+        ));
+
+        for (String line : packagesOutput.split("\r?\n")) {
+            String pkg = line.replace("package:", "").trim();
+            if (!pkg.isEmpty() && !targetPackages.contains(pkg)) {
+                targetPackages.add(pkg);
+            }
+        }
+
+        StringBuilder stopCmd = new StringBuilder();
+        for (String pkg : targetPackages) {
+            if (whitelist.contains(pkg)) continue;
+            if (runningOutput.contains(pkg)) {
+                stoppedApps++;
+            }
+            if (stopCmd.length() > 0) stopCmd.append("; ");
+            stopCmd.append("am force-stop ").append(pkg);
+        }
+
+        if (stopCmd.length() > 0) {
+            runShellCommand(in, out, 4, stopCmd.toString());
+        }
+
+        if (reopenTcp5555) {
+            try {
+                byte[] tcpipPayload = "tcpip:5555\0".getBytes(StandardCharsets.UTF_8);
+                sendPacket(out, A_OPEN, 5, 0, tcpipPayload);
+                readPacket(in);
+            } catch (Exception ignored) {
+                // Al activar tcpip:5555 el demonio adbd reinicia el socket
+            }
+        }
+
+        return stoppedApps;
+    }
+
+    private void connectPlainAdb(InputStream in, OutputStream out, KeyPair keyPair) throws Exception {
         sendPacket(out, A_CNXN, 0x01000000, 4096, "host::\0".getBytes(StandardCharsets.UTF_8));
 
         AdbMessage msg = readPacket(in);
@@ -168,7 +342,132 @@ public class MainActivity extends Activity {
                 }
             }
         }
-        throw new Exception("Autorización ADB pendiente o rechazada");
+        throw new Exception("Acepta el permiso de Depuración USB en la pantalla del TV");
+    }
+
+    private SSLContext createAdbSslContext(KeyPair keyPair) throws Exception {
+        X509Certificate cert = generateSelfSignedCertificate(keyPair);
+
+        KeyManager km = new X509ExtendedKeyManager() {
+            @Override
+            public String chooseClientAlias(String[] keyType, Principal[] issuers, Socket socket) {
+                return "adb";
+            }
+
+            @Override
+            public String chooseServerAlias(String keyType, Principal[] issuers, Socket socket) {
+                return null;
+            }
+
+            @Override
+            public X509Certificate[] getCertificateChain(String alias) {
+                return new X509Certificate[]{cert};
+            }
+
+            @Override
+            public String[] getClientAliases(String keyType, Principal[] issuers) {
+                return new String[]{"adb"};
+            }
+
+            @Override
+            public PrivateKey getPrivateKey(String alias) {
+                return keyPair.getPrivate();
+            }
+
+            @Override
+            public String[] getServerAliases(String keyType, Principal[] issuers) {
+                return null;
+            }
+        };
+
+        TrustManager tm = new X509TrustManager() {
+            @Override
+            public void checkClientTrusted(X509Certificate[] chain, String authType) {}
+
+            @Override
+            public void checkServerTrusted(X509Certificate[] chain, String authType) {}
+
+            @Override
+            public X509Certificate[] getAcceptedIssuers() {
+                return new X509Certificate[0];
+            }
+        };
+
+        SSLContext sc = SSLContext.getInstance("TLSv1.3");
+        sc.init(new KeyManager[]{km}, new TrustManager[]{tm}, new SecureRandom());
+        return sc;
+    }
+
+    private X509Certificate generateSelfSignedCertificate(KeyPair kp) throws Exception {
+        byte[] pubKeyEncoded = kp.getPublic().getEncoded();
+
+        byte[] cnOid = new byte[]{0x06, 0x03, 0x55, 0x04, 0x03};
+        byte[] cnVal = derTag(0x0C, "adb".getBytes(StandardCharsets.UTF_8));
+        byte[] atv = derTag(0x30, concat(cnOid, cnVal));
+        byte[] rdn = derTag(0x31, atv);
+        byte[] name = derTag(0x30, rdn);
+
+        byte[] notBefore = derTag(0x17, "240101000000Z".getBytes(StandardCharsets.US_ASCII));
+        byte[] notAfter  = derTag(0x17, "491231235959Z".getBytes(StandardCharsets.US_ASCII));
+        byte[] validity  = derTag(0x30, concat(notBefore, notAfter));
+
+        byte[] version = derTag(0xA0, new byte[]{0x02, 0x01, 0x02});
+        byte[] serial = new byte[]{0x02, 0x01, 0x01};
+        byte[] sigAlg = new byte[]{
+            0x30, 0x0D,
+            0x06, 0x09, 0x2A, (byte) 0x86, 0x48, (byte) 0x86, (byte) 0xF7, 0x0D, 0x01, 0x01, 0x0B,
+            0x05, 0x00
+        };
+
+        byte[] tbsCert = derTag(0x30, concat(
+            version,
+            serial,
+            sigAlg,
+            name,
+            validity,
+            name,
+            pubKeyEncoded
+        ));
+
+        Signature sig = Signature.getInstance("SHA256withRSA");
+        sig.initSign(kp.getPrivate());
+        sig.update(tbsCert);
+        byte[] signatureBytes = sig.sign();
+
+        byte[] bitStringPayload = new byte[signatureBytes.length + 1];
+        bitStringPayload[0] = 0x00;
+        System.arraycopy(signatureBytes, 0, bitStringPayload, 1, signatureBytes.length);
+        byte[] sigBitString = derTag(0x03, bitStringPayload);
+
+        byte[] certDer = derTag(0x30, concat(tbsCert, sigAlg, sigBitString));
+        CertificateFactory cf = CertificateFactory.getInstance("X.509");
+        return (X509Certificate) cf.generateCertificate(new ByteArrayInputStream(certDer));
+    }
+
+    private byte[] derTag(int tag, byte[] content) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        out.write(tag);
+        int len = content.length;
+        if (len < 128) {
+            out.write(len);
+        } else if (len < 256) {
+            out.write(0x81);
+            out.write(len);
+        } else {
+            out.write(0x82);
+            out.write((len >> 8) & 0xFF);
+            out.write(len & 0xFF);
+        }
+        out.write(content, 0, len);
+        return out.toByteArray();
+    }
+
+    private byte[] concat(byte[]... arrays) {
+        ByteArrayOutputStream out = new ByteArrayOutputStream();
+        for (byte[] a : arrays) {
+            out.write(a, 0, a.length);
+        }
+        return out.toByteArray();
     }
 
     private String runShellCommand(InputStream in, OutputStream out, int localId, String cmd) throws Exception {
