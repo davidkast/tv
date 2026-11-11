@@ -35,10 +35,9 @@ import java.security.cert.X509Certificate;
 import java.security.interfaces.RSAPublicKey;
 import java.security.spec.PKCS8EncodedKeySpec;
 import java.security.spec.X509EncodedKeySpec;
-import java.util.ArrayList;
 import java.util.Arrays;
 import java.util.HashSet;
-import java.util.List;
+import java.util.LinkedHashSet;
 import java.util.Set;
 import java.util.concurrent.CountDownLatch;
 import java.util.concurrent.TimeUnit;
@@ -75,7 +74,7 @@ public class MainActivity extends Activity {
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
 
-        Toast.makeText(this, "Cerrando apps y limpiando caché...", Toast.LENGTH_SHORT).show();
+        Toast.makeText(this, "Cerrando apps en ejecución y limpiando caché...", Toast.LENGTH_SHORT).show();
 
         new Thread(() -> {
             try {
@@ -195,7 +194,6 @@ public class MainActivity extends Activity {
             Settings.Global.putInt(getContentResolver(), "adb_wifi_enabled", 1);
             Thread.sleep(500);
         } catch (Exception ignored) {
-            // Si aún no tiene WRITE_SECURE_SETTINGS, continúa por si Depuración inalámbrica ya está activa
         }
     }
 
@@ -259,56 +257,106 @@ public class MainActivity extends Activity {
     private int runCleanupSequence(InputStream in, OutputStream out, boolean reopenTcp5555) throws Exception {
         int stoppedApps = 0;
 
+        // 1. Limpiar caché global
         runShellCommand(in, out, 1, "pm trim-caches 999G");
 
-        String runningOutput = runShellCommand(in, out, 2, "ps -A");
-        String packagesOutput = runShellCommand(in, out, 3, "pm list packages -3");
+        // 2. Detectar procesos en ejecución y el launcher predeterminado actual
+        String runningOutput = runShellCommand(in, out, 2, "ps -A -o NAME,ARGS");
+        String defaultLauncherOut = runShellCommand(
+            in, out, 3,
+            "cmd shortcut get-default-launcher; cmd package resolve-activity --brief -a android.intent.action.MAIN -c android.intent.category.HOME"
+        );
 
+        // 3. Obtener TODAS las apps instaladas (de usuario + preinstaladas con icono en TV/Android)
+        String allAppsOutput = runShellCommand(
+            in, out, 4,
+            "pm list packages -3; " +
+            "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LEANBACK_LAUNCHER; " +
+            "cmd package query-activities --brief -a android.intent.action.MAIN -c android.intent.category.LAUNCHER"
+        );
+
+        // 4. Construir lista blanca (sistema + launchers + el launcher activo detectado)
         Set<String> whitelist = new HashSet<>(Arrays.asList(
+            "android",
             "com.tuapp.tvcleaner",
             "com.tuapp.tvcleaner.adb",
-            "me.efesser.flauncher",
+            // Launchers personalizados y oficiales
             "com.spocky.projengmenu",
+            "me.efesser.flauncher",
             "com.wolf.firelauncher",
+            "ca.dstudio.atvlauncher.free",
+            "ca.dstudio.atvlauncher.pro",
+            "dxidev.sideloadchannel3",
+            "dxidev.sideloadchannel4",
+            "com.Emil.dispatch",
+            "com.google.android.apps.tv.launcherx",
+            "com.google.android.tvlauncher",
+            "com.google.android.leanbacklauncher",
+            // Remapeadores de botones y servicios esenciales del TV
             "flar2.homebutton",
-            "dev.vodik7.tvquickactions"
+            "dev.vodik7.tvquickactions",
+            "com.android.tv.settings",
+            "com.android.settings",
+            "com.android.systemui",
+            "com.android.vending",
+            "com.google.android.gms",
+            "com.google.android.gsf",
+            "com.google.android.katniss",
+            "com.google.android.tv.remote.service",
+            "com.google.android.inputmethod.latin",
+            "com.google.android.marvin.talkback"
         ));
 
-        List<String> targetPackages = new ArrayList<>(Arrays.asList(
-            "com.google.android.youtube.tv",
-            "com.google.android.youtube.tvmusic",
-            "com.netflix.ninja",
-            "com.amazon.amazonvideo.livingroom"
-        ));
-
-        for (String line : packagesOutput.split("\r?\n")) {
-            String pkg = line.replace("package:", "").trim();
-            if (!pkg.isEmpty() && !targetPackages.contains(pkg)) {
-                targetPackages.add(pkg);
+        for (String line : defaultLauncherOut.split("\r?\n")) {
+            String trimmed = line.trim();
+            if (trimmed.contains("/")) {
+                String beforeSlash = trimmed.split("/")[0];
+                if (beforeSlash.contains("{")) {
+                    beforeSlash = beforeSlash.substring(beforeSlash.lastIndexOf('{') + 1);
+                }
+                beforeSlash = beforeSlash.trim();
+                if (!beforeSlash.isEmpty()) {
+                    whitelist.add(beforeSlash);
+                }
             }
         }
 
+        // 5. Extraer todos los paquetes de aplicaciones
+        Set<String> targetPackages = new LinkedHashSet<>();
+        for (String line : allAppsOutput.split("\r?\n")) {
+            String trimmed = line.trim();
+            if (trimmed.startsWith("package:")) {
+                String pkg = trimmed.substring("package:".length()).trim();
+                if (!pkg.isEmpty()) targetPackages.add(pkg);
+            } else if (trimmed.contains("/")) {
+                String pkg = trimmed.split("/")[0].trim();
+                if (!pkg.isEmpty() && pkg.contains(".")) {
+                    targetPackages.add(pkg);
+                }
+            }
+        }
+
+        // 6. Forzar el cierre de las aplicaciones que están ejecutándose
         StringBuilder stopCmd = new StringBuilder();
         for (String pkg : targetPackages) {
             if (whitelist.contains(pkg)) continue;
             if (runningOutput.contains(pkg)) {
                 stoppedApps++;
+                if (stopCmd.length() > 0) stopCmd.append("; ");
+                stopCmd.append("am force-stop ").append(pkg);
             }
-            if (stopCmd.length() > 0) stopCmd.append("; ");
-            stopCmd.append("am force-stop ").append(pkg);
         }
 
         if (stopCmd.length() > 0) {
-            runShellCommand(in, out, 4, stopCmd.toString());
+            runShellCommand(in, out, 5, stopCmd.toString());
         }
 
         if (reopenTcp5555) {
             try {
                 byte[] tcpipPayload = "tcpip:5555\0".getBytes(StandardCharsets.UTF_8);
-                sendPacket(out, A_OPEN, 5, 0, tcpipPayload);
+                sendPacket(out, A_OPEN, 6, 0, tcpipPayload);
                 readPacket(in);
             } catch (Exception ignored) {
-                // Al activar tcpip:5555 el demonio adbd reinicia el socket
             }
         }
 
